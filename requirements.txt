@@ -1,6 +1,7 @@
 fastapi
 uvicorn[standard]
-transformers
---extra-index-url https://download.pytorch.org/whl/cpu
-torch
+onnxruntime
+tokenizers
+huggingface_hub
+numpy
 pydantic

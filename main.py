@@ -1,39 +1,48 @@
 """
-Sentiment classifier API.
-
-Loads the fine-tuned DistilBERT model (from ./sentiment_model, or from the
-Hugging Face Hub if MODEL_SOURCE is set to a hub repo id) and exposes a
-/predict endpoint. Also serves the static frontend at /.
+Sentiment classifier API — ONNX runtime version (no torch, tiny memory footprint).
 """
 
 import os
+import json
+import numpy as np
+import onnxruntime as ort
+from tokenizers import Tokenizer
+from huggingface_hub import hf_hub_download
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from transformers import pipeline
 
-# If you pushed your model to the Hugging Face Hub, set this env var to
-# "your-username/sentiment-distilbert" instead of using a local folder.
-MODEL_SOURCE = os.environ.get("MODEL_SOURCE", "./sentiment_model")
+MODEL_REPO = os.environ.get("MODEL_SOURCE", "KrisGod/sentiment-distilbert-onnx")
 
 app = FastAPI(title="Sentiment Classifier API")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# Allow the frontend (even if hosted elsewhere) to call this API
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-classifier = None
+session = None
+tokenizer = None
+id2label = None
 
 
 @app.on_event("startup")
 def load_model():
-    global classifier
-    classifier = pipeline("text-classification", model=MODEL_SOURCE, tokenizer=MODEL_SOURCE)
+    global session, tokenizer, id2label
+
+    model_path = hf_hub_download(MODEL_REPO, "model.onnx")
+    tokenizer_path = hf_hub_download(MODEL_REPO, "tokenizer.json")
+    config_path = hf_hub_download(MODEL_REPO, "config.json")
+
+    session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+    tokenizer = Tokenizer.from_file(tokenizer_path)
+    tokenizer.enable_truncation(max_length=256)
+
+    with open(config_path) as f:
+        config = json.load(f)
+    id2label = {int(k): v for k, v in config["id2label"].items()}
+
+
+def softmax(x):
+    e = np.exp(x - np.max(x))
+    return e / e.sum()
 
 
 class PredictRequest(BaseModel):
@@ -52,8 +61,24 @@ def predict(req: PredictRequest):
     if len(req.text) > 5000:
         raise HTTPException(status_code=400, detail="text too long (max 5000 chars)")
 
-    result = classifier(req.text[:2000])[0]
-    return PredictResponse(label=result["label"], confidence=round(result["score"], 4))
+    encoding = tokenizer.encode(req.text[:2000])
+    input_ids = np.array([encoding.ids], dtype=np.int64)
+    attention_mask = np.array([encoding.attention_mask], dtype=np.int64)
+
+    input_names = [i.name for i in session.get_inputs()]
+    feed = {}
+    if "input_ids" in input_names:
+        feed["input_ids"] = input_ids
+    if "attention_mask" in input_names:
+        feed["attention_mask"] = attention_mask
+    if "token_type_ids" in input_names:
+        feed["token_type_ids"] = np.zeros_like(input_ids)
+
+    logits = session.run(None, feed)[0][0]
+    probs = softmax(logits)
+    idx = int(np.argmax(probs))
+
+    return PredictResponse(label=id2label[idx], confidence=round(float(probs[idx]), 4))
 
 
 @app.get("/health")
@@ -61,5 +86,4 @@ def health():
     return {"status": "ok"}
 
 
-# Serve the frontend (index.html + assets) at the root URL
 app.mount("/", StaticFiles(directory="static", html=True), name="static")
